@@ -1,8 +1,17 @@
 import * as CheerpX from "https://cxrtnc.leaningtech.com/1.2.8/cx.esm.js";
 
 const DISK_URL = "wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2";
-const DB_ROOT = "webpython-root-v1";
-const DB_WORKSPACE = "webpython-workspace-v1";
+// IMPORTANT: these IDs deliberately use a fresh namespace so a broken older
+// overlay cannot poison the new VM.
+const DB_ROOT = "webpython-root-v4";
+const DB_WORKSPACE = "webpython-workspace-v4";
+
+// CheerpX requires a mount target that already exists inside the root image.
+// The official WebVM image already contains /home/user/documents, so we use
+// that as the persistent IDB-backed mount and expose it at /workspace with a
+// normal Linux symlink.
+const WORKSPACE_MOUNT = "/home/user/documents";
+const WORKSPACE_PATH = "/workspace";
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
@@ -49,7 +58,21 @@ const normalOpts = {
   gid: 1000,
 };
 
-const rootOpts = { ...normalOpts, uid: 0, gid: 0, HOME: undefined };
+const rootOpts = {
+  env: [
+    "HOME=/root",
+    "TERM=dumb",
+    "USER=root",
+    "SHELL=/bin/bash",
+    "EDITOR=vim",
+    "LANG=C.UTF-8",
+    "LC_ALL=C",
+    "PS1=# ",
+  ],
+  cwd: "/root",
+  uid: 0,
+  gid: 0,
+};
 
 autoBoot();
 
@@ -58,25 +81,35 @@ async function autoBoot() {
     if (location.protocol === "file:") {
       throw new Error("file:// では動きません。HTTPSのWebサイトか localhost で開いてください。");
     }
+
+    setStatus("ブラウザ環境を確認中…");
     if (!window.crossOriginIsolated) {
-      setStatus("COOP/COEP待機中…");
-      // coi-serviceworker can reload once; give it a moment before hard-failing.
-      await new Promise((r) => setTimeout(r, 900));
+      await new Promise((r) => setTimeout(r, 700));
     }
     if (!window.crossOriginIsolated) {
-      throw new Error("Cross-Origin Isolation が有効になっていません。GitHub Pagesなら coi-serviceworker、Cloudflare Pagesなら _headers を使用してください。");
+      throw new Error(
+        "Cross-Origin Isolation が有効ではありません。HTTPS + COOP/COEP が必要です。GitHub Pagesでは coi-serviceworker.js を使用します。"
+      );
     }
 
-    setStatus("Debianディスクへ接続中…");
-    const cloud = await CheerpX.CloudDevice.create(DISK_URL);
+    setStatus("CheerpXを準備中…");
+    appendTerminal("[webpython] Cross-Origin Isolation: OK\n", "system");
+
+    setStatus("Linuxディスクへ接続中…");
+    const cloud = await createCloudDevice();
+
+    setStatus("書き込み層を準備中…");
     const rootCache = await CheerpX.IDBDevice.create(DB_ROOT);
     rootOverlay = await CheerpX.OverlayDevice.create(cloud, rootCache);
     workspaceDevice = await CheerpX.IDBDevice.create(DB_WORKSPACE);
     dataDevice = await CheerpX.DataDevice.create();
 
+    // Do NOT mount the new IDB device directly at /workspace: that path does
+    // not exist in the official image and Linux.create expects parent paths to
+    // already exist. /home/user/documents is known to exist in WebVM.
     const mounts = [
       { type: "ext2", path: "/", dev: rootOverlay },
-      { type: "dir", path: "/workspace", dev: workspaceDevice },
+      { type: "dir", path: WORKSPACE_MOUNT, dev: workspaceDevice },
       { type: "dir", path: "/data", dev: dataDevice },
       { type: "devs", path: "/dev" },
       { type: "devpts", path: "/dev/pts" },
@@ -84,6 +117,7 @@ async function autoBoot() {
       { type: "sys", path: "/sys" },
     ];
 
+    setStatus("Linuxカーネル環境を起動中…");
     cx = await CheerpX.Linux.create({ mounts });
     shellInput = cx.setCustomConsole((buf) => {
       const text = decoder.decode(new Uint8Array(buf), { stream: true });
@@ -95,12 +129,21 @@ async function autoBoot() {
       }
     });
 
-    setStatus("Linux初期化中…");
-    await enqueue(() => cx.run("/bin/chmod", ["-R", "u+rwX,g+rwX", "/workspace"], rootOpts));
+    setStatus("/workspaceを構成中…");
+    const linkResult = await enqueue(() => cx.run(
+      "/bin/bash",
+      ["-lc", `set -e; if [ -e ${shQuote(WORKSPACE_PATH)} ] || [ -L ${shQuote(WORKSPACE_PATH)} ]; then rm -rf ${shQuote(WORKSPACE_PATH)}; fi; ln -s ${shQuote(WORKSPACE_MOUNT)} ${shQuote(WORKSPACE_PATH)}; chmod -R u+rwX,g+rwX ${shQuote(WORKSPACE_MOUNT)}`],
+      rootOpts
+    ));
+    if ((linkResult?.status ?? 0) !== 0) {
+      throw new Error("/workspace の初期化に失敗しました");
+    }
 
+    setStatus("ワークスペースを準備中…");
     await ensureInitialWorkspace();
     await refreshExplorer();
     startInteractiveShell();
+
     vmBadge.textContent = "Linux online";
     vmBadge.className = "badge online";
     setStatus("Linux ready");
@@ -112,14 +155,39 @@ async function autoBoot() {
       await openFile("/workspace/main.py");
     }
 
-    appendTerminal("WebPython Linux ready. 例: python3 --version / apt --version\n", "system");
+    appendTerminal("WebPython Linux ready. python3 / apt / bash が使えます。\n", "system");
   } catch (error) {
-    console.error(error);
+    console.error("[WebPython boot]", error);
     vmBadge.textContent = "Error";
     vmBadge.className = "badge error";
     setStatus("起動失敗");
     appendTerminal(`[WebPython] ${error?.stack || error}\n`, "error");
+    appendTerminal("[対処] ページを再読み込みしてください。古いVMキャッシュが原因なら新しいWebPython DB(v4)を使用します。\n", "system");
     showToast(error.message || String(error), true);
+  }
+}
+
+async function createCloudDevice() {
+  try {
+    return await CheerpX.CloudDevice.create(DISK_URL);
+  } catch (firstError) {
+    // Match the official WebVM fallback: retry the same image over HTTPS when
+    // the WebSocket backend is temporarily unavailable.
+    if (DISK_URL.startsWith("wss:")) {
+      setStatus("WebSocket接続を再試行中…");
+      try {
+        return await CheerpX.CloudDevice.create(
+          "https:" + DISK_URL.slice("wss:".length)
+        );
+      } catch (secondError) {
+        const err = new Error(
+          `Linuxディスクへ接続できませんでした。\nWSS: ${firstError?.message || firstError}\nHTTPS: ${secondError?.message || secondError}`
+        );
+        err.cause = secondError;
+        throw err;
+      }
+    }
+    throw firstError;
   }
 }
 
@@ -204,7 +272,7 @@ async function copyDataToWorkspace(bytesOrText, targetPath) {
   shellPath(targetPath);
   const payload = `/payload_${++payloadCounter}`;
   await dataDevice.writeFile(payload, typeof bytesOrText === "string" ? bytesOrText : new Uint8Array(bytesOrText));
-  const parent = targetPath.slice(0, targetPath.lastIndexOf("/")) || "/workspace";
+  const parent = targetPath.slice(0, targetPath.lastIndexOf("/")) || WORKSPACE_PATH;
   const result = await enqueue(() => cx.run("/bin/bash", ["-lc", `mkdir -p ${shQuote(parent)} && cp -- ${shQuote("/data" + payload)} ${shQuote(targetPath)}`], rootOpts));
   if (result.status !== 0) throw new Error(`ファイル配置に失敗しました: ${targetPath}`);
 }
@@ -217,7 +285,7 @@ async function readWorkspaceText(path) {
 }
 
 async function ensureInitialWorkspace() {
-  const result = await captureCommand("find /workspace -mindepth 1 -maxdepth 1 -print", { show: false });
+  const result = await captureCommand("find -L /workspace -mindepth 1 -maxdepth 1 -print", { show: false });
   if (result.status !== 0 || result.text.trim() === "") {
     await copyDataToWorkspace("print(\"Hello Linux!\")\n", "/workspace/main.py");
     await copyDataToWorkspace("# WebPython test\nprint(2 + 3)\n", "/workspace/test.py");
@@ -225,7 +293,7 @@ async function ensureInitialWorkspace() {
 }
 
 async function refreshExplorer() {
-  const result = await captureCommand("find /workspace -mindepth 1 -maxdepth 4 -printf '%y\\t%p\\n' | sort", { show: false });
+  const result = await captureCommand("find -L /workspace -mindepth 1 -maxdepth 4 -printf '%y\\t%p\\n' | sort", { show: false });
   if (result.status !== 0) return;
   treeEntries = result.text
     .split("\n")
@@ -411,7 +479,7 @@ async function importDirectoryHandle(handle, relative) {
 async function exportFolder() {
   if (!window.showDirectoryPicker) return showToast("このブラウザはフォルダ書き込みをサポートしていません", true);
   const dir = await window.showDirectoryPicker({ mode: "readwrite" });
-  const result = await captureCommand("find /workspace -type f -print", { show: false });
+  const result = await captureCommand("find -L /workspace -type f -print", { show: false });
   const paths = result.text.split("\n").map((x) => x.trim()).filter(Boolean);
   for (const path of paths) {
     const relative = path.replace(/^\/workspace\//, "");
