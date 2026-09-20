@@ -5,7 +5,7 @@ Browser-first Python IDE powered by CheerpX/WebVM's Debian environment.
 ## What it does
 
 - Runs real `python3` inside a browser Linux VM.
-- Uses a persistent `/workspace` backed by IndexedDB.
+- Uses a persistent `/workspace` inside the guest Linux filesystem; the root Ext2 overlay is backed by IndexedDB.
 - Save / Run / tabs / Explorer.
 - Integrated one-command terminal.
 - Optional `root` mode for package management (`apt`).
@@ -50,3 +50,6 @@ apt install python3-pip
 ```
 
 Then normal user commands can use Python/pip as appropriate.
+
+### Architecture note
+The app follows the official CheerpX/WebVM mount pattern: a remote read-only Debian Ext2 image is wrapped in an IndexedDB OverlayDevice. `/workspace` is created directly inside that guest filesystem rather than mounting an IDBDevice as a `dir` device.

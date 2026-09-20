@@ -1,16 +1,9 @@
 import * as CheerpX from "https://cxrtnc.leaningtech.com/1.2.8/cx.esm.js";
 
-const DISK_URL = "wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2";
+const DISK_URL = "wss://disks.webvm.io/debian_large_20230522_5044875331.ext2";
 // IMPORTANT: these IDs deliberately use a fresh namespace so a broken older
 // overlay cannot poison the new VM.
-const DB_ROOT = "webpython-root-v4";
-const DB_WORKSPACE = "webpython-workspace-v4";
-
-// CheerpX requires a mount target that already exists inside the root image.
-// The official WebVM image already contains /home/user/documents, so we use
-// that as the persistent IDB-backed mount and expose it at /workspace with a
-// normal Linux symlink.
-const WORKSPACE_MOUNT = "/home/user/documents";
+const DB_ROOT = "webpython-root-v5";
 const WORKSPACE_PATH = "/workspace";
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -31,7 +24,6 @@ const toast = $("toast");
 
 let cx = null;
 let dataDevice = null;
-let workspaceDevice = null;
 let rootOverlay = null;
 let payloadCounter = 0;
 let commandQueue = Promise.resolve();
@@ -101,15 +93,13 @@ async function autoBoot() {
     setStatus("書き込み層を準備中…");
     const rootCache = await CheerpX.IDBDevice.create(DB_ROOT);
     rootOverlay = await CheerpX.OverlayDevice.create(cloud, rootCache);
-    workspaceDevice = await CheerpX.IDBDevice.create(DB_WORKSPACE);
     dataDevice = await CheerpX.DataDevice.create();
 
-    // Do NOT mount the new IDB device directly at /workspace: that path does
-    // not exist in the official image and Linux.create expects parent paths to
-    // already exist. /home/user/documents is known to exist in WebVM.
+    // Keep the mount table aligned with the official CheerpX/WebVM pattern:
+    // the IDB device is used as the writable overlay for the root Ext2 image.
+    // Do NOT mount an IDBDevice as a `dir` device.
     const mounts = [
       { type: "ext2", path: "/", dev: rootOverlay },
-      { type: "dir", path: WORKSPACE_MOUNT, dev: workspaceDevice },
       { type: "dir", path: "/data", dev: dataDevice },
       { type: "devs", path: "/dev" },
       { type: "devpts", path: "/dev/pts" },
@@ -130,12 +120,12 @@ async function autoBoot() {
     });
 
     setStatus("/workspaceを構成中…");
-    const linkResult = await enqueue(() => cx.run(
+    const workspaceResult = await enqueue(() => cx.run(
       "/bin/bash",
-      ["-lc", `set -e; if [ -e ${shQuote(WORKSPACE_PATH)} ] || [ -L ${shQuote(WORKSPACE_PATH)} ]; then rm -rf ${shQuote(WORKSPACE_PATH)}; fi; ln -s ${shQuote(WORKSPACE_MOUNT)} ${shQuote(WORKSPACE_PATH)}; chmod -R u+rwX,g+rwX ${shQuote(WORKSPACE_MOUNT)}`],
+      ["-lc", `set -e; mkdir -p ${shQuote(WORKSPACE_PATH)}; chown user:user ${shQuote(WORKSPACE_PATH)}; chmod 755 ${shQuote(WORKSPACE_PATH)}`],
       rootOpts
     ));
-    if ((linkResult?.status ?? 0) !== 0) {
+    if ((workspaceResult?.status ?? 0) !== 0) {
       throw new Error("/workspace の初期化に失敗しました");
     }
 
