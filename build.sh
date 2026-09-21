@@ -107,6 +107,37 @@ git branch --show-current || true
 echo
 
 ###############################################################################
+# WebPython2 compatibility patch: restore urllib.request and its dependencies
+#
+# CPython's Emscripten stdlib bundle intentionally omits synchronous networking
+# modules. WebPython2 needs urllib.request to be importable so it can later be
+# backed by a browser-side fetch bridge. Keep this patch idempotent.
+###############################################################################
+
+echo "[WebPython2] Restoring urllib.request stdlib modules..."
+
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("Platforms/emscripten/wasm_assets.py")
+text = p.read_text(encoding="utf-8")
+
+for item in (
+    '    "http/",\\n',
+    '    "urllib/error.py",\\n',
+    '    "urllib/request.py",\\n',
+    '    "urllib/response.py",\\n',
+):
+    text = text.replace(item, "")
+
+p.write_text(text, encoding="utf-8")
+print("Patched:", p)
+PY
+
+echo "urllib networking modules restored for packaging."
+echo
+
+###############################################################################
 # 3. Install / activate Node.js 24
 ###############################################################################
 
